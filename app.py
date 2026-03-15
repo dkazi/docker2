@@ -3,17 +3,21 @@ import os
 import time
 import json
 import re
-import matplotlib.pyplot as plt
+import subprocess
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from datetime import datetime
 from openai import OpenAI
+import sys
+sys.path.insert(0, "/app")
 
 # ── PATHS ──────────────────────────────────────────────────────────────────────
 WATCH_DIR        = "/data_to_monitor"
 MASTER_FILE_PATH = "/app/master_log.txt"
 HISTORY_DIR      = "/app/chat_history"
 FLAGS_FILE       = "/app/flagged_ips.json"
+RESULTS_FILE     = "/app/detection_results.json"
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
 st.set_page_config(page_title="AI Log Security Analyst",
@@ -21,12 +25,14 @@ st.set_page_config(page_title="AI Log Security Analyst",
 
 # ── SESSION STATE ──────────────────────────────────────────────────────────────
 for k, v in {
-    "logging_active":  False,
-    "messages":        [],
-    "multiselect_key": 0,
-    "ai_error":        None,
-    "last_pos":        {},
-    "session_name":    datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+    "logging_active":   False,
+    "messages":         [],
+    "multiselect_key":  0,
+    "ai_error":         None,
+    "last_pos":         {},
+    "session_name":     datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+    "detection_running": False,
+    "chat_history":     [],   # for GOD_OF_CHAT intent engine
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -75,6 +81,16 @@ def load_all_sessions() -> dict:
             except Exception:
                 pass
     return sessions
+
+
+def load_detection_results() -> dict | None:
+    if os.path.exists(RESULTS_FILE):
+        try:
+            with open(RESULTS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
 
 
 def generate_pdf(messages: list, session_name: str) -> bytes:
@@ -157,12 +173,12 @@ def extract_ips_from_logs(selected: list[str], n: int = 1000) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda x: x[1], reverse=True))
 
 
-# ── CHART HELPERS (matplotlib = static, no zoom) ──────────────────────────────
+# ── CHART HELPERS ──────────────────────────────────────────────────────────────
 DARK_BG   = "#0e1117"
 DARK_FG   = "#c8c8c8"
 DARK_GRID = "#2a2a2a"
-ACCENT    = ["#4da6ff", "#ff4b4b", "#ffa600", "#00e676",
-             "#bf5af2", "#ff6b6b", "#48dbfb", "#ffd32a"]
+ACCENT    = ["#4da6ff","#ff4b4b","#ffa600","#00e676",
+             "#bf5af2","#ff6b6b","#48dbfb","#ffd32a"]
 
 def _base_fig(w=7, h=3.2):
     fig, ax = plt.subplots(figsize=(w, h))
@@ -174,106 +190,81 @@ def _base_fig(w=7, h=3.2):
     ax.set_axisbelow(True)
     return fig, ax
 
-
-def bar_chart(data: dict, title: str, color: str = "#4da6ff"):
-    if not data:
-        return None
+def bar_chart(data: dict, title: str, color="#4da6ff"):
+    if not data: return None
     fig, ax = _base_fig()
-    keys   = list(data.keys())
-    values = list(data.values())
-    bars = ax.bar(keys, values, color=color, width=0.6, zorder=3)
+    keys, vals = list(data.keys()), list(data.values())
+    bars = ax.bar(keys, vals, color=color, width=0.6, zorder=3)
     ax.set_title(title, color=DARK_FG, fontsize=10, pad=8)
     ax.set_xticklabels(keys, rotation=35, ha="right", fontsize=7)
-    for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                str(val), ha="center", va="bottom",
-                color=DARK_FG, fontsize=7)
+    for bar, val in zip(bars, vals):
+        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.3,
+                str(val), ha="center", va="bottom", color=DARK_FG, fontsize=7)
     fig.tight_layout()
     return fig
 
-
 def pie_chart(data: dict, title: str):
-    if not data:
-        return None
-    # Keep top 6, group the rest as "Other"
+    if not data: return None
     items = sorted(data.items(), key=lambda x: x[1], reverse=True)
     if len(items) > 6:
-        top   = dict(items[:6])
-        other = sum(v for _, v in items[6:])
-        top["Other"] = other
+        top = dict(items[:6])
+        top["Other"] = sum(v for _, v in items[6:])
         items = list(top.items())
     labels = [k for k, _ in items]
     values = [v for _, v in items]
-    colors = ACCENT[:len(labels)]
-
     fig, ax = _base_fig(w=5, h=4)
-    wedges, texts, autotexts = ax.pie(
-        values,
-        labels=None,
-        colors=colors,
-        autopct="%1.0f%%",
-        startangle=140,
-        wedgeprops={"linewidth": 0.5, "edgecolor": DARK_BG},
-        pctdistance=0.78,
-    )
+    wedges, _, autotexts = ax.pie(
+        values, colors=ACCENT[:len(labels)], autopct="%1.0f%%",
+        startangle=140, wedgeprops={"linewidth":0.5, "edgecolor":DARK_BG},
+        pctdistance=0.78)
     for t in autotexts:
-        t.set_color(DARK_BG)
-        t.set_fontsize(8)
-        t.set_fontweight("bold")
-    ax.legend(
-        wedges, labels,
-        loc="lower center",
-        bbox_to_anchor=(0.5, -0.18),
-        ncol=3,
-        fontsize=7,
-        frameon=False,
-        labelcolor=DARK_FG,
-    )
+        t.set_color(DARK_BG); t.set_fontsize(8); t.set_fontweight("bold")
+    ax.legend(wedges, labels, loc="lower center", bbox_to_anchor=(0.5,-0.18),
+              ncol=3, fontsize=7, frameon=False, labelcolor=DARK_FG)
     ax.set_title(title, color=DARK_FG, fontsize=10, pad=10)
     fig.tight_layout()
     return fig
 
-
 def hourly_bar(hourly: dict, title: str):
-    if not any(hourly.values()):
-        return None
+    if not any(hourly.values()): return None
     fig, ax = _base_fig(w=8, h=3)
-    hours  = list(hourly.keys())
-    values = list(hourly.values())
-    bars   = ax.bar(hours, values, color="#4da6ff", width=0.7, zorder=3)
+    hours, vals = list(hourly.keys()), list(hourly.values())
+    bars = ax.bar(hours, vals, color="#4da6ff", width=0.7, zorder=3)
     ax.set_title(title, color=DARK_FG, fontsize=10, pad=8)
     ax.set_xlabel("Hour (00–23)", color=DARK_FG, fontsize=8)
     ax.tick_params(axis="x", labelsize=6)
-    # highlight the busiest hour
-    if values:
-        peak = max(values)
-        for bar, val in zip(bars, values):
+    if vals:
+        peak = max(vals)
+        for bar, val in zip(bars, vals):
             if val == peak and peak > 0:
                 bar.set_color("#ffa600")
     fig.tight_layout()
     return fig
 
 
+# ── API KEY — διαβάζεται από το .env, όχι από το UI ──────────────────────────
+api_key = os.getenv("OPENAI_API_KEY", "")
+
 # ── SIDEBAR ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ System Settings")
-    api_key = st.text_input("OpenAI API Key:", type="password",
-                            autocomplete="new-password")
+    if not api_key:
+        st.error("⚠️ OPENAI_API_KEY δεν βρέθηκε.\nΠρόσθεσέ το στο .env αρχείο.")
+    else:
+        st.success("✅ OpenAI API Key φορτώθηκε.")
     st.markdown("---")
     st.subheader("📁 Log Sources")
-
     selected_files = st.multiselect(
         "Select Files:", options=files, default=None,
         disabled=st.session_state.logging_active,
         key=f"files_{st.session_state.multiselect_key}",
     )
-
     if not st.session_state.logging_active:
         if st.button("✅ Start Monitoring", type="primary",
                      use_container_width=True):
             if selected_files:
-                st.session_state.logging_active = True
-                st.session_state.session_name   = datetime.now().strftime(
+                st.session_state.logging_active  = True
+                st.session_state.session_name    = datetime.now().strftime(
                     "%Y-%m-%d_%H-%M-%S")
                 st.session_state.last_pos = {}
                 with open(MASTER_FILE_PATH, "w", encoding="utf-8") as f:
@@ -292,18 +283,17 @@ with st.sidebar:
             if os.path.exists(MASTER_FILE_PATH):
                 os.remove(MASTER_FILE_PATH)
             st.rerun()
-
     if st.session_state.logging_active:
         st.markdown("---")
         st.success("📡 Monitoring Active")
-
     if st.session_state.ai_error:
         st.error(st.session_state.ai_error)
 
 
 # ── TABS ───────────────────────────────────────────────────────────────────────
-tab_chat, tab_dashboard, tab_live, tab_history, tab_security = st.tabs([
+tab_chat, tab_soc, tab_dashboard, tab_live, tab_history, tab_flags = st.tabs([
     "🤖 AI Chatbot",
+    "🛡️ SOC Analysis",
     "📊 Dashboard",
     "📡 Live Logs",
     "🕓 History",
@@ -312,11 +302,10 @@ tab_chat, tab_dashboard, tab_live, tab_history, tab_security = st.tabs([
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB 1 — CHATBOT
+#  TAB 1 — CHATBOT (simple, logs-based, as before)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_chat:
     st.title("🤖 AI Security Analyst")
-
     tb1, tb2, tb3 = st.columns([1, 1, 1])
     with tb1:
         if st.button("🆕 New chat", use_container_width=True):
@@ -338,20 +327,15 @@ with tab_chat:
         if st.session_state.messages:
             pdf_bytes = generate_pdf(st.session_state.messages,
                                      st.session_state.session_name)
-            st.download_button(
-                "📄 Export PDF",
-                data=pdf_bytes,
+            st.download_button("📄 Export PDF", data=pdf_bytes,
                 file_name=f"logguard_{st.session_state.session_name}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-
+                mime="application/pdf", use_container_width=True)
     st.divider()
 
     can_chat = bool(api_key and selected_files and st.session_state.logging_active)
     if not can_chat:
         if not api_key:
-            st.warning("Enter your OpenAI API key in the sidebar.")
+            st.error("OPENAI_API_KEY δεν βρέθηκε στο .env αρχείο.")
         elif not st.session_state.logging_active:
             st.warning("Start monitoring from the sidebar first.")
 
@@ -371,24 +355,161 @@ with tab_chat:
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system",
-                     "content": "You are a Cyber Security Analyst."},
+                    {"role": "system", "content": "You are a Cyber Security Analyst."},
                     {"role": "user",
                      "content": f"LOGS:\n{log_context}\n\nQUESTION: {prompt}"},
                 ],
             )
             reply = response.choices[0].message.content
-            st.session_state.messages.append(
-                {"role": "assistant", "content": reply})
-            save_history(st.session_state.session_name,
-                         st.session_state.messages)
+            st.session_state.messages.append({"role": "assistant", "content": reply})
+            save_history(st.session_state.session_name, st.session_state.messages)
         except Exception as e:
             st.session_state.ai_error = f"AI Error: {e}"
         st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB 2 — DASHBOARD
+#  TAB 2 — SOC ANALYSIS (GOD_OF_DETECTION + GOD_OF_CHAT)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_soc:
+    st.title("🛡️ SOC Deep Analysis")
+    st.caption("Run GOD_OF_DETECTION on your logs, then ask the SOC chatbot.")
+
+    # ── Step 1: Run detection ──────────────────────────────────────────────────
+    st.subheader("Step 1 — Run detection engine")
+
+    # Find log files inside container to pass to detection
+    log_files_available = []
+    if os.path.exists(WATCH_DIR):
+        for root, _, fnames in os.walk(WATCH_DIR):
+            for fn in fnames:
+                log_files_available.append(
+                    os.path.join(root, fn))
+
+    detection_target = st.selectbox(
+        "Log file to analyze:",
+        options=log_files_available if log_files_available else ["(no files found)"],
+        label_visibility="visible",
+    )
+
+    col_run, col_status = st.columns([1, 3])
+    with col_run:
+        run_detection = st.button(
+            "▶ Run GOD_OF_DETECTION",
+            type="primary",
+            use_container_width=True,
+            disabled=not (api_key and log_files_available),
+        )
+    with col_status:
+        results = load_detection_results()
+        if results:
+            st.success(
+                f"✅ Last run: {results['generated_at'][:16]}  |  "
+                f"{results['total_logs']} logs  |  "
+                f"{results['suspicious_ips_count']} suspicious IPs"
+            )
+        else:
+            st.info("No detection results yet. Run the engine first.")
+
+    if run_detection:
+        if not api_key:
+            st.error("Enter OpenAI API key first.")
+        else:
+            with st.spinner("Running GOD_OF_DETECTION… this may take a minute."):
+                env = os.environ.copy()
+                env["OPENAI_API_KEY"] = api_key
+                env["LOG_FILE_PATH"]  = detection_target
+                result = subprocess.run(
+                    ["python3", "/app/GOD_OF_DETECTION.py"],
+                    capture_output=True, text=True,
+                    cwd="/app", env=env, timeout=300,
+                )
+            if result.returncode == 0:
+                st.success("Detection complete!")
+                with st.expander("Detection output"):
+                    st.code(result.stdout[-3000:], language="text")
+                st.rerun()
+            else:
+                st.error("Detection failed.")
+                with st.expander("Error details"):
+                    st.code(result.stderr[-2000:], language="text")
+
+    st.divider()
+
+    # ── Step 2: SOC Chat — χρησιμοποιεί απευθείας GOD_OF_CHAT.ask() ─────────────
+    st.subheader("Step 2 — Ask the SOC chatbot")
+
+    results = load_detection_results()
+    can_soc_chat = bool(api_key and results)
+
+    if not can_soc_chat:
+        if not api_key:
+            st.error("OPENAI_API_KEY δεν βρέθηκε στο .env αρχείο.")
+        elif not results:
+            st.warning("Run detection first (Step 1).")
+
+    # Show SOC chat history
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if soc_prompt := st.chat_input(
+        "Ask the SOC analyst… e.g. 'Ποια η πιο επικίνδυνη IP;'",
+        disabled=not can_soc_chat,
+        key="soc_input",
+    ):
+        st.session_state.chat_history.append(
+            {"role": "user", "content": soc_prompt})
+        with st.chat_message("user"):
+            st.markdown(soc_prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing…"):
+                try:
+                    import GOD_OF_CHAT as god_chat
+
+                    # history για follow-up ερωτήσεις (τελευταία 4 μηνύματα)
+                    history_for_chat = [
+                        m for m in st.session_state.chat_history[:-1]
+                        if m["role"] in ("user", "assistant")
+                    ][-4:]
+
+                    # prompt → GOD_OF_CHAT.ask() → απάντηση → interface
+                    reply = god_chat.ask(soc_prompt, results, history_for_chat)
+
+                    st.markdown(reply)
+                    st.session_state.chat_history.append(
+                        {"role": "assistant", "content": reply})
+                except Exception as e:
+                    st.error(f"GOD_OF_CHAT error: {e}")
+
+    if st.session_state.chat_history:
+        sc1, sc2 = st.columns([1, 5])
+        with sc1:
+            if st.button("🗑️ Clear SOC chat"):
+                st.session_state.chat_history = []
+                st.rerun()
+        with sc2:
+            if st.button("💾 Save SOC chat"):
+                name = "SOC_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                save_history(name, st.session_state.chat_history)
+                st.toast("✅ SOC chat saved!")
+
+        # Quick-result cards from detection
+        if results:
+            st.divider()
+            st.caption("Quick stats from last detection run:")
+            qc1, qc2, qc3, qc4 = st.columns(4)
+            qc1.metric("Total logs",     results["total_logs"])
+            qc2.metric("Unique IPs",     results["unique_ips"])
+            qc3.metric("Suspicious IPs", results["suspicious_ips_count"])
+            top_attack = max(results["attack_stats"].items(),
+                             key=lambda x: x[1], default=("—", 0))
+            qc4.metric("Top attack", f"{top_attack[0]} ({top_attack[1]})")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB 3 — DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_dashboard:
     st.title("📊 Log Dashboard")
@@ -403,10 +524,8 @@ with tab_dashboard:
                 st.rerun()
         with dc2:
             st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
-
         st.divider()
 
-        # ── Collect stats ──────────────────────────────────────────────────────
         total_lines    = 0
         ip_counts: dict[str, int] = {}
         keyword_counts = {
@@ -433,82 +552,62 @@ with tab_dashboard:
                 if m and m.group(1) in hourly_counts:
                     hourly_counts[m.group(1)] += 1
 
-        # ── Metric cards ───────────────────────────────────────────────────────
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("📄 Lines analysed",  f"{total_lines:,}")
         c2.metric("🚫 Failed logins",    keyword_counts["Failed password"])
         c3.metric("✅ Accepted logins",  keyword_counts["Accepted"])
         c4.metric("🔥 Firewall blocks",  keyword_counts["UFW BLOCK"])
-
         st.divider()
 
-        # ── Row 1: keyword bar + event-type pie ────────────────────────────────
-        row1_l, row1_r = st.columns(2)
-
-        with row1_l:
+        r1l, r1r = st.columns(2)
+        with r1l:
             kw_data = {k: v for k, v in keyword_counts.items() if v > 0}
             fig = bar_chart(kw_data, "Keyword frequency", color="#4da6ff")
             if fig:
-                st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
+                st.pyplot(fig, use_container_width=True); plt.close(fig)
             else:
                 st.caption("No keyword matches yet.")
-
-        with row1_r:
-            # Pie: breakdown of event types
-            pie_data = {k: v for k, v in keyword_counts.items() if v > 0}
-            fig = pie_chart(pie_data, "Event type breakdown")
+        with r1r:
+            fig = pie_chart({k: v for k, v in keyword_counts.items() if v > 0},
+                            "Event type breakdown")
             if fig:
-                st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
+                st.pyplot(fig, use_container_width=True); plt.close(fig)
             else:
-                st.caption("No data for pie chart yet.")
+                st.caption("No data yet.")
 
         st.divider()
-
-        # ── Row 2: hourly activity bar ─────────────────────────────────────────
         fig = hourly_bar(hourly_counts, "Activity by hour  (🟠 = busiest)")
         if fig:
-            st.pyplot(fig, use_container_width=True)
-            plt.close(fig)
+            st.pyplot(fig, use_container_width=True); plt.close(fig)
         else:
             st.caption("No timestamped entries found.")
 
         st.divider()
-
-        # ── Row 3: top IPs bar + top IPs pie ──────────────────────────────────
         if ip_counts:
             top_ips = dict(sorted(ip_counts.items(),
                                   key=lambda x: x[1], reverse=True)[:10])
-            row3_l, row3_r = st.columns(2)
-
-            with row3_l:
-                fig = bar_chart(top_ips, "Top 10 IPs — hit count",
-                                color="#ffa600")
+            r3l, r3r = st.columns(2)
+            with r3l:
+                fig = bar_chart(top_ips, "Top 10 IPs", color="#ffa600")
                 if fig:
-                    st.pyplot(fig, use_container_width=True)
-                    plt.close(fig)
-
-            with row3_r:
+                    st.pyplot(fig, use_container_width=True); plt.close(fig)
+            with r3r:
                 fig = pie_chart(top_ips, "Top IPs — share of traffic")
                 if fig:
-                    st.pyplot(fig, use_container_width=True)
-                    plt.close(fig)
+                    st.pyplot(fig, use_container_width=True); plt.close(fig)
         else:
-            st.caption("No IPs found in logs.")
+            st.caption("No IPs found.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB 3 — LIVE LOGS
+#  TAB 4 — LIVE LOGS
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_live:
     st.title("📡 Live Logs")
-
     if not st.session_state.logging_active or not selected_files:
         st.info("Start monitoring from the sidebar to see live logs.")
     else:
         now_str = datetime.now().strftime("%H:%M:%S")
-
         top1, top2, top3 = st.columns([3, 1, 1])
         with top1:
             st.html(f"""
@@ -525,19 +624,16 @@ with tab_live:
   <span style="color:#00e676;font-size:13px;font-weight:600;
                font-family:monospace;">LIVE</span>
   <span style="color:#555;font-size:12px;font-family:monospace;">{now_str}</span>
-</div>
-""")
+</div>""")
         with top2:
             if st.button("🔄 Refresh", use_container_width=True, key="live_ref"):
                 st.rerun()
         with top3:
-            auto = st.toggle("Auto 4s", key="live_auto",
-                             help="Turn off when using other tabs.")
+            auto = st.toggle("Auto 4s", key="live_auto")
 
         n_lines = st.slider("Lines per file", 50, 500, 150, step=50,
                             key="live_slider")
-        search  = st.text_input("Filter",
-                                placeholder="e.g. sshd, sudo, 192.168",
+        search  = st.text_input("Filter", placeholder="e.g. sshd, sudo, 192.168",
                                 label_visibility="collapsed")
 
         for rel in selected_files:
@@ -551,114 +647,83 @@ with tab_live:
                     rows = "".join(
                         '<div style="font-family:monospace;font-size:12px;'
                         'padding:1px 4px;color:#c8c8c8;">'
-                        + l.replace("&", "&amp;").replace("<", "&lt;")
-                                   .replace(">", "&gt;")
-                        + "</div>"
-                        for l in lines
-                    )
-                    st.html(
-                        '<div style="background:#0e1117;border-radius:6px;'
-                        'padding:10px;max-height:320px;overflow-y:auto;'
-                        'border:1px solid #2a2a2a;">'
-                        + rows + "</div>"
-                    )
-
+                        + l.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                        + "</div>" for l in lines)
+                    st.html('<div style="background:#0e1117;border-radius:6px;'
+                            'padding:10px;max-height:320px;overflow-y:auto;'
+                            'border:1px solid #2a2a2a;">' + rows + "</div>")
         if auto:
             time.sleep(4)
             st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB 4 — HISTORY
+#  TAB 5 — HISTORY
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_history:
     st.title("🕓 Chat History")
-
     sessions = load_all_sessions()
     if not sessions:
-        st.info("No saved sessions yet. Use 💾 Save chat or chat — "
-                "sessions are auto-saved after each AI reply.")
+        st.info("No saved sessions yet.")
     else:
-        selected_session = st.selectbox(
-            "Select a session:", options=list(sessions.keys()))
-
-        if selected_session:
-            msgs = sessions[selected_session]
-            st.caption(f"{len(msgs)} messages · {selected_session}")
+        sel = st.selectbox("Select a session:", options=list(sessions.keys()))
+        if sel:
+            msgs = sessions[sel]
+            st.caption(f"{len(msgs)} messages · {sel}")
             st.divider()
-
             for msg in msgs:
                 with st.chat_message(msg["role"]):
                     st.markdown(msg["content"])
-
             st.divider()
             hc1, hc2 = st.columns([1, 1])
             with hc1:
-                pdf_bytes = generate_pdf(msgs, selected_session)
-                st.download_button(
-                    "📄 Export PDF",
-                    data=pdf_bytes,
-                    file_name=f"logguard_{selected_session}.pdf",
-                    mime="application/pdf",
-                    key="hist_pdf",
-                    use_container_width=True,
-                )
+                pdf_bytes = generate_pdf(msgs, sel)
+                st.download_button("📄 Export PDF", data=pdf_bytes,
+                    file_name=f"logguard_{sel}.pdf", mime="application/pdf",
+                    key="hist_pdf", use_container_width=True)
             with hc2:
                 if st.button("🗑️ Delete session", key="del_session",
                              use_container_width=True):
-                    path = os.path.join(HISTORY_DIR, f"{selected_session}.json")
+                    path = os.path.join(HISTORY_DIR, f"{sel}.json")
                     if os.path.exists(path):
                         os.remove(path)
                     st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB 5 — FLAGGED IPs
+#  TAB 6 — FLAGGED IPs
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_security:
+with tab_flags:
     st.title("🚩 Flagged IPs")
     flags = load_flags()
 
-    # ── Flag IPs from logs ─────────────────────────────────────────────────────
     st.subheader("IPs detected in logs")
-
     if not selected_files or not st.session_state.logging_active:
         st.info("Start monitoring to detect IPs.")
     else:
         ip_counts = extract_ips_from_logs(selected_files, 1000)
-
         if not ip_counts:
-            st.caption("No IPs found in current logs.")
+            st.caption("No IPs found.")
         else:
-            st.caption("IP · Hits · Flag · Note")
             for ip, count in list(ip_counts.items())[:30]:
                 is_flagged = flags.get(ip, {}).get("flagged", False)
-
                 col_ip, col_count, col_flag, col_note = st.columns([2, 1, 1, 4])
-
                 with col_ip:
-                    marker = "🚩" if is_flagged else "  "
-                    st.markdown(f"{marker} `{ip}`")
-
+                    st.markdown(f"{'🚩' if is_flagged else '  '} `{ip}`")
                 with col_count:
                     st.caption(f"{count} hits")
-
                 with col_flag:
-                    label = "Unflag" if is_flagged else "🚩 Flag"
-                    if st.button(label, key=f"flag_{ip}",
-                                 use_container_width=True):
+                    if st.button("Unflag" if is_flagged else "🚩 Flag",
+                                 key=f"flag_{ip}", use_container_width=True):
                         if ip not in flags:
                             flags[ip] = {}
                         flags[ip]["flagged"] = not is_flagged
                         save_flags(flags)
                         st.rerun()
-
                 with col_note:
-                    note = st.text_input(
-                        "Note", key=f"note_{ip}",
+                    note = st.text_input("Note", key=f"note_{ip}",
                         value=flags.get(ip, {}).get("note", ""),
-                        placeholder="add a note…",
-                        label_visibility="collapsed")
+                        placeholder="add a note…", label_visibility="collapsed")
                     if note != flags.get(ip, {}).get("note", ""):
                         if ip not in flags:
                             flags[ip] = {}
@@ -666,8 +731,6 @@ with tab_security:
                         save_flags(flags)
 
     st.divider()
-
-    # ── Summary of all flagged IPs ─────────────────────────────────────────────
     st.subheader("All flagged IPs")
     flagged = {ip: d for ip, d in flags.items() if d.get("flagged")}
     if not flagged:
@@ -687,7 +750,7 @@ with tab_security:
                     st.rerun()
 
 
-# ── FRAGMENT — log engine (original, untouched) ────────────────────────────────
+# ── FRAGMENT — log engine ──────────────────────────────────────────────────────
 @st.fragment(run_every="2s")
 def log_engine():
     if st.session_state.logging_active and selected_files:
