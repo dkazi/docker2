@@ -346,25 +346,50 @@ with tab_chat:
     if prompt := st.chat_input("Ask me about the logs…", disabled=not can_chat):
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.session_state.ai_error = None
-        try:
-            client = OpenAI(api_key=api_key)
-            log_context = ""
-            if os.path.exists(MASTER_FILE_PATH):
-                with open(MASTER_FILE_PATH, "r", encoding="utf-8") as f:
-                    log_context = f.read()[-5000:]
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a Cyber Security Analyst."},
-                    {"role": "user",
-                     "content": f"LOGS:\n{log_context}\n\nQUESTION: {prompt}"},
-                ],
-            )
-            reply = response.choices[0].message.content
-            st.session_state.messages.append({"role": "assistant", "content": reply})
-            save_history(st.session_state.session_name, st.session_state.messages)
-        except Exception as e:
-            st.session_state.ai_error = f"AI Error: {e}"
+        with st.chat_message("assistant"):
+            loading = st.empty()
+            loading.html("""
+<style>
+@keyframes blink {
+  0%,100% { opacity: 1; } 50% { opacity: 0.2; }
+}
+</style>
+<div style="display:flex;align-items:center;gap:10px;padding:8px 0;">
+  <div style="display:flex;gap:5px;">
+    <div style="width:8px;height:8px;border-radius:50%;background:#00e676;
+                animation:blink 1.2s ease-in-out infinite;"></div>
+    <div style="width:8px;height:8px;border-radius:50%;background:#00e676;
+                animation:blink 1.2s ease-in-out infinite 0.2s;"></div>
+    <div style="width:8px;height:8px;border-radius:50%;background:#00e676;
+                animation:blink 1.2s ease-in-out infinite 0.4s;"></div>
+  </div>
+  <span style="color:#00e676;font-size:13px;font-family:monospace;">
+    Analyzing logs…
+  </span>
+</div>
+""")
+            try:
+                client = OpenAI(api_key=api_key)
+                log_context = ""
+                if os.path.exists(MASTER_FILE_PATH):
+                    with open(MASTER_FILE_PATH, "r", encoding="utf-8") as f:
+                        log_context = f.read()[-5000:]
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a Cyber Security Analyst."},
+                        {"role": "user",
+                         "content": f"LOGS:\n{log_context}\n\nQUESTION: {prompt}"},
+                    ],
+                )
+                reply = response.choices[0].message.content
+                loading.empty()
+                st.markdown(reply)
+                st.session_state.messages.append({"role": "assistant", "content": reply})
+                save_history(st.session_state.session_name, st.session_state.messages)
+            except Exception as e:
+                loading.empty()
+                st.session_state.ai_error = f"AI Error: {e}"
         st.rerun()
 
 
@@ -464,24 +489,48 @@ with tab_soc:
             st.markdown(soc_prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Analyzing…"):
-                try:
-                    import GOD_OF_CHAT as god_chat
+            # Animated loading indicator
+            loading = st.empty()
+            loading.html("""
+<style>
+@keyframes blink {
+  0%,100% { opacity: 1; } 50% { opacity: 0.2; }
+}
+</style>
+<div style="display:flex;align-items:center;gap:10px;padding:8px 0;">
+  <div style="display:flex;gap:5px;">
+    <div style="width:8px;height:8px;border-radius:50%;background:#4da6ff;
+                animation:blink 1.2s ease-in-out infinite;"></div>
+    <div style="width:8px;height:8px;border-radius:50%;background:#4da6ff;
+                animation:blink 1.2s ease-in-out infinite 0.2s;"></div>
+    <div style="width:8px;height:8px;border-radius:50%;background:#4da6ff;
+                animation:blink 1.2s ease-in-out infinite 0.4s;"></div>
+  </div>
+  <span style="color:#4da6ff;font-size:13px;font-family:monospace;">
+    SOC Analyst analyzing…
+  </span>
+</div>
+""")
+            try:
+                import GOD_OF_CHAT as god_chat
 
-                    # history για follow-up ερωτήσεις (τελευταία 4 μηνύματα)
-                    history_for_chat = [
-                        m for m in st.session_state.chat_history[:-1]
-                        if m["role"] in ("user", "assistant")
-                    ][-4:]
+                # history για follow-up ερωτήσεις (τελευταία 4 μηνύματα)
+                history_for_chat = [
+                    m for m in st.session_state.chat_history[:-1]
+                    if m["role"] in ("user", "assistant")
+                ][-4:]
 
-                    # prompt → GOD_OF_CHAT.ask() → απάντηση → interface
-                    reply = god_chat.ask(soc_prompt, results, history_for_chat)
+                # prompt → GOD_OF_CHAT.ask() → απάντηση → interface
+                reply = god_chat.ask(soc_prompt, results, history_for_chat)
 
-                    st.markdown(reply)
-                    st.session_state.chat_history.append(
-                        {"role": "assistant", "content": reply})
-                except Exception as e:
-                    st.error(f"GOD_OF_CHAT error: {e}")
+                # Καθάρισε το loading και εμφάνισε την απάντηση
+                loading.empty()
+                st.markdown(reply)
+                st.session_state.chat_history.append(
+                    {"role": "assistant", "content": reply})
+            except Exception as e:
+                loading.empty()
+                st.error(f"GOD_OF_CHAT error: {e}")
 
     if st.session_state.chat_history:
         sc1, sc2 = st.columns([1, 5])
