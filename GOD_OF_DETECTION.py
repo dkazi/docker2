@@ -44,7 +44,7 @@ def save_offset(offset: int):
         json.dump({"offset": offset, "updated": datetime.now().isoformat()}, f)
 
 
-def load_existing_results() -> dict | None:
+def load_existing_results() -> dict:
     """Load previous detection_results.json if it exists."""
     if os.path.exists(RESULTS_FILE):
         try:
@@ -345,7 +345,7 @@ class AttackDetector:
             ],
         }
 
-    def detect(self, log: str) -> list[str]:
+    def detect(self, log: str) -> list:
         attacks = []
         for attack_name, patterns in self.patterns.items():
             for pat in patterns:
@@ -354,14 +354,14 @@ class AttackDetector:
                     break
         return attacks if attacks else ["normal"]
 
-    def get_severity(self, attacks: list[str]) -> int:
+    def get_severity(self, attacks) -> int:
         return max((ATTACK_TAXONOMY.get(a, {}).get("severity", 0) for a in attacks), default=0)
 
-    def get_mitre_tactics(self, attacks: list[str]) -> list[str]:
+    def get_mitre_tactics(self, attacks) -> list:
         return list({ATTACK_TAXONOMY.get(a, {}).get("mitre") for a in attacks
                      if ATTACK_TAXONOMY.get(a, {}).get("mitre")})
 
-    def get_categories(self, attacks: list[str]) -> list[str]:
+    def get_categories(self, attacks) -> list:
         return list({ATTACK_TAXONOMY.get(a, {}).get("category", "unknown") for a in attacks})
 
 
@@ -458,7 +458,7 @@ class ContextAnalyzer:
         score += len(d["attack_chains_detected"] if hasattr(d, "attack_chains_detected") else []) * 5
         return min(score, 100)
 
-    def detect_attack_chain(self, ip: str) -> list[str]:
+    def detect_attack_chain(self, ip: str) -> list:
         attacks = set(self.ip_events[ip]["attacks"])
         chains = []
         if any(a in attacks for a in ["vulnerability_scanner","directory_enumeration","web_fingerprinting"]):
@@ -737,7 +737,7 @@ def main():
     all_suspicious.sort(key=lambda x: x[2], reverse=True)
 
     # ── Build timestamps for per-IP ────────────────────────────────────
-    ip_ts_cache: dict[str, list] = defaultdict(list)
+    ip_ts_cache = defaultdict(list)
     for log in logs:
         metadata = normalizer.extract_metadata(log)
         ip = metadata.get("source_ip", "unknown")
