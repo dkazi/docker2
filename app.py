@@ -12,9 +12,10 @@ st.set_page_config(page_title="AI Log Security Analyst", layout="wide", page_ico
 # --- INITIALIZATION ---
 if 'logging_active' not in st.session_state:
     st.session_state.logging_active = False
-
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if 'multiselect_key' not in st.session_state:
+    st.session_state.multiselect_key = 0
 
 # --- 1. ΑΝΙΧΝΕΥΣΗ ΑΡΧΕΙΩΝ ---
 files = []
@@ -25,23 +26,17 @@ if os.path.exists(WATCH_DIR):
             files.append(rel_path)
     files.sort()
 
-# --- 2. SIDEBAR: ΡΥΘΜΙΣΕΙΣ & LOGS ---
+# --- 2. SIDEBAR: ΡΥΘΜΙΣΕΙΣ ---
 st.sidebar.header("⚙️ System Settings")
 
-# API Key - Με autocomplete="new-password" για να μην πετάει το "Manage Passwords"
 api_key = st.sidebar.text_input(
     "OpenAI API Key:",
     type="password",
-    help="Εισάγετε το κλειδί σας για να ενεργοποιηθεί ο Analyst",
     autocomplete="new-password"
 )
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📁 Log Sources")
-
-# Επιλογή αρχείων (Χρησιμοποιούμε ένα key που αλλάζει στο reset για να αδειάζει η λίστα)
-if 'multiselect_key' not in st.session_state:
-    st.session_state.multiselect_key = 0
 
 selected_files = st.sidebar.multiselect(
     "Select Files:",
@@ -51,9 +46,7 @@ selected_files = st.sidebar.multiselect(
     key=f"files_{st.session_state.multiselect_key}"
 )
 
-# ΚΟΥΜΠΙΑ ΕΛΕΓΧΟΥ
 col1, col2 = st.sidebar.columns(2)
-
 with col1:
     if not st.session_state.logging_active:
         if st.button("✅ Start", type="primary", use_container_width=True):
@@ -64,74 +57,73 @@ with col1:
                 st.rerun()
             else:
                 st.sidebar.warning("Select files!")
-
 with col2:
     if st.button("🗑️ Reset", use_container_width=True):
         st.session_state.logging_active = False
         st.session_state.messages = []
-        st.session_state.multiselect_key += 1  # Αυτό "πετάει" τις επιλογές από το GUI
+        st.session_state.multiselect_key += 1
         if 'last_pos' in st.session_state:
             del st.session_state.last_pos
         if os.path.exists(MASTER_FILE_PATH):
             os.remove(MASTER_FILE_PATH)
         st.rerun()
 
-# --- 3. ΚΥΡΙΟ GUI: CHATBOT (ΜΕΓΑΛΟ) ---
+# --- 3. ΚΥΡΙΟ GUI: CHATBOT ---
 st.title("🤖 AI Security Analyst")
-st.caption("Live Log Monitoring & Intelligent Analysis")
 
-# Container για το chat history (Μεγάλο, στο κέντρο)
-chat_container = st.container()
+# Έλεγχος αν επιτρέπεται το chat
+can_chat = api_key and selected_files and st.session_state.logging_active
 
-with chat_container:
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+# Προβολή μηνυμάτων
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-# Chat Input στο κάτω μέρος της κεντρικής οθόνης
-if prompt := st.chat_input("Ask me about the security logs..."):
-    if not api_key:
-        st.error("Please enter an API Key in the sidebar first!")
-    else:
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+# Chat Input (Disabled αν δεν πληρούνται οι προϋποθέσεις)
+prompt = st.chat_input(
+    "Ask me about the security logs..." if can_chat else "Provide API Key, Select Files and press Start to chat",
+    disabled=not can_chat
+)
 
-        # Διάβασμα Context
-        log_context = ""
-        if os.path.exists(MASTER_FILE_PATH):
-            with open(MASTER_FILE_PATH, "r", encoding="utf-8") as f:
-                log_context = f.read()[-5000:] # Περισσότερο context για καλύτερη ανάλυση
+if prompt:
+    # Προσθήκη και εμφάνιση του χρήστη αμέσως
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-        # AI Response
-        try:
-            client = OpenAI(api_key=api_key)
-            with st.chat_message("assistant"):
-                full_system_prompt = "You are a professional Cyber Security Analyst. Use the provided logs to answer. Be concise and technical."
-                full_user_prompt = f"SYSTEM LOGS:\n{log_context}\n\nUSER QUESTION: {prompt}"
-               
-                response = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": full_system_prompt},
-                        {"role": "user", "content": full_user_prompt},
-                    ]
-                )
-                answer = response.choices[0].message.content
-                st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-        except Exception as e:
-            st.error(f"AI Error: {e}")
+    # Διάβασμα Context
+    log_context = ""
+    if os.path.exists(MASTER_FILE_PATH):
+        with open(MASTER_FILE_PATH, "r", encoding="utf-8") as f:
+            log_context = f.read()[-5000:]
+
+    # AI Response
+    try:
+        client = OpenAI(api_key=api_key)
+        with st.chat_message("assistant"):
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a Cyber Security Analyst. Analyze the logs provided."},
+                    {"role": "user", "content": f"LOGS:\n{log_context}\n\nQUESTION: {prompt}"}
+                ]
+            )
+            answer = response.choices[0].message.content
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+    except Exception as e:
+        st.error(f"AI Error: {e}")
 
 # --- 4. BACKGROUND LOGGING ENGINE ---
 if st.session_state.logging_active and selected_files:
-    # Εμφάνιση status σε ένα μικρό σημείο στο sidebar
-    st.sidebar.success(f"Monitoring {len(selected_files)} files...")
+    # Χρήση ενός σταθερού container για το status στο sidebar για αποφυγή flickering
+    st.sidebar.markdown("---")
+    st.sidebar.success("📡 System Monitoring Active")
    
     if 'last_pos' not in st.session_state:
         st.session_state.last_pos = {f: 0 for f in selected_files}
 
-    # Το loop τρέχει "πίσω" από το GUI
+    # Εκτέλεση του logging
     with open(MASTER_FILE_PATH, "a", encoding="utf-8") as master:
         for f_name in selected_files:
             full_path = os.path.join(WATCH_DIR, f_name)
@@ -144,6 +136,6 @@ if st.session_state.logging_active and selected_files:
                         master.write(header + new_data)
                         st.session_state.last_pos[f_name] = f.tell()
    
-    # Μικρή καθυστέρηση και αυτόματη ανανέωση αν υπάρχουν νέα logs
+    # Το rerun γίνεται μόνο αν δεν υπάρχει ενεργό chat input αυτή τη στιγμή
     time.sleep(2)
     st.rerun()
