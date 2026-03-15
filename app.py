@@ -3,7 +3,9 @@ import os
 import time
 import json
 import re
-import subprocess
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("Agg")
 from datetime import datetime
 from openai import OpenAI
 
@@ -129,7 +131,7 @@ def generate_pdf(messages: list, session_name: str) -> bytes:
     return b"%PDF-1.4\n" + objects_body + xref.encode() + trailer.encode()
 
 
-# ── IP / PORT CONTROL ──────────────────────────────────────────────────────────
+# ── FLAGS ──────────────────────────────────────────────────────────────────────
 def load_flags() -> dict:
     if os.path.exists(FLAGS_FILE):
         try:
@@ -145,69 +147,6 @@ def save_flags(data: dict):
         json.dump(data, f, indent=2)
 
 
-def run_iptables(args: list[str]) -> tuple[bool, str]:
-    # Try iptables, fallback to iptables-legacy (common in newer kernels)
-    for cmd in ["iptables", "iptables-legacy"]:
-        try:
-            result = subprocess.run(
-                [cmd] + args,
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                return True, result.stdout.strip()
-            # rule doesn't exist is ok for -D
-            if "does a rule exist" in result.stderr or \
-               "No chain/target/match" in result.stderr or \
-               "Bad rule" in result.stderr:
-                return True, "rule not found (already removed)"
-        except FileNotFoundError:
-            continue
-        except Exception as e:
-            return False, str(e)
-    return False, ("iptables not available. Make sure docker-compose.yml "
-                   "has 'privileged: true' and 'network_mode: host', "
-                   "then rebuild: docker compose up --build")
-
-
-def block_ip(ip: str) -> tuple[bool, str]:
-    ok1, m1 = run_iptables(["-I", "INPUT",  "1", "-s", ip, "-j", "DROP"])
-    ok2, m2 = run_iptables(["-I", "OUTPUT", "1", "-d", ip, "-j", "DROP"])
-    if ok1 and ok2:
-        return True, f"Blocked {ip} (INPUT + OUTPUT)"
-    return False, m1 or m2
-
-
-def unblock_ip(ip: str) -> tuple[bool, str]:
-    run_iptables(["-D", "INPUT",  "-s", ip, "-j", "DROP"])
-    run_iptables(["-D", "OUTPUT", "-d", ip, "-j", "DROP"])
-    return True, f"Unblocked {ip}"
-
-
-def block_port(port: int, proto: str = "tcp") -> tuple[bool, str]:
-    ok, msg = run_iptables(["-I", "INPUT", "1", "-p", proto,
-                            "--dport", str(port), "-j", "DROP"])
-    return ok, f"Port {port}/{proto} blocked" if ok else msg
-
-
-def unblock_port(port: int, proto: str = "tcp") -> tuple[bool, str]:
-    run_iptables(["-D", "INPUT", "-p", proto, "--dport", str(port), "-j", "DROP"])
-    return True, f"Port {port}/{proto} unblocked"
-
-
-def get_blocked_ips() -> list[str]:
-    ok, out = run_iptables(["-L", "INPUT", "-n", "--line-numbers"])
-    if not ok:
-        return []
-    ips = []
-    ip_pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-    for line in out.splitlines():
-        if "DROP" in line:
-            m = ip_pattern.search(line)
-            if m:
-                ips.append(m.group())
-    return list(set(ips))
-
-
 def extract_ips_from_logs(selected: list[str], n: int = 1000) -> dict[str, int]:
     ip_pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
     counts: dict[str, int] = {}
@@ -216,6 +155,103 @@ def extract_ips_from_logs(selected: list[str], n: int = 1000) -> dict[str, int]:
             for ip in ip_pattern.findall(line):
                 counts[ip] = counts.get(ip, 0) + 1
     return dict(sorted(counts.items(), key=lambda x: x[1], reverse=True))
+
+
+# ── CHART HELPERS (matplotlib = static, no zoom) ──────────────────────────────
+DARK_BG   = "#0e1117"
+DARK_FG   = "#c8c8c8"
+DARK_GRID = "#2a2a2a"
+ACCENT    = ["#4da6ff", "#ff4b4b", "#ffa600", "#00e676",
+             "#bf5af2", "#ff6b6b", "#48dbfb", "#ffd32a"]
+
+def _base_fig(w=7, h=3.2):
+    fig, ax = plt.subplots(figsize=(w, h))
+    fig.patch.set_facecolor(DARK_BG)
+    ax.set_facecolor(DARK_BG)
+    ax.tick_params(colors=DARK_FG, labelsize=8)
+    ax.spines[:].set_color(DARK_GRID)
+    ax.yaxis.grid(True, color=DARK_GRID, linewidth=0.5)
+    ax.set_axisbelow(True)
+    return fig, ax
+
+
+def bar_chart(data: dict, title: str, color: str = "#4da6ff"):
+    if not data:
+        return None
+    fig, ax = _base_fig()
+    keys   = list(data.keys())
+    values = list(data.values())
+    bars = ax.bar(keys, values, color=color, width=0.6, zorder=3)
+    ax.set_title(title, color=DARK_FG, fontsize=10, pad=8)
+    ax.set_xticklabels(keys, rotation=35, ha="right", fontsize=7)
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
+                str(val), ha="center", va="bottom",
+                color=DARK_FG, fontsize=7)
+    fig.tight_layout()
+    return fig
+
+
+def pie_chart(data: dict, title: str):
+    if not data:
+        return None
+    # Keep top 6, group the rest as "Other"
+    items = sorted(data.items(), key=lambda x: x[1], reverse=True)
+    if len(items) > 6:
+        top   = dict(items[:6])
+        other = sum(v for _, v in items[6:])
+        top["Other"] = other
+        items = list(top.items())
+    labels = [k for k, _ in items]
+    values = [v for _, v in items]
+    colors = ACCENT[:len(labels)]
+
+    fig, ax = _base_fig(w=5, h=4)
+    wedges, texts, autotexts = ax.pie(
+        values,
+        labels=None,
+        colors=colors,
+        autopct="%1.0f%%",
+        startangle=140,
+        wedgeprops={"linewidth": 0.5, "edgecolor": DARK_BG},
+        pctdistance=0.78,
+    )
+    for t in autotexts:
+        t.set_color(DARK_BG)
+        t.set_fontsize(8)
+        t.set_fontweight("bold")
+    ax.legend(
+        wedges, labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.18),
+        ncol=3,
+        fontsize=7,
+        frameon=False,
+        labelcolor=DARK_FG,
+    )
+    ax.set_title(title, color=DARK_FG, fontsize=10, pad=10)
+    fig.tight_layout()
+    return fig
+
+
+def hourly_bar(hourly: dict, title: str):
+    if not any(hourly.values()):
+        return None
+    fig, ax = _base_fig(w=8, h=3)
+    hours  = list(hourly.keys())
+    values = list(hourly.values())
+    bars   = ax.bar(hours, values, color="#4da6ff", width=0.7, zorder=3)
+    ax.set_title(title, color=DARK_FG, fontsize=10, pad=8)
+    ax.set_xlabel("Hour (00–23)", color=DARK_FG, fontsize=8)
+    ax.tick_params(axis="x", labelsize=6)
+    # highlight the busiest hour
+    if values:
+        peak = max(values)
+        for bar, val in zip(bars, values):
+            if val == peak and peak > 0:
+                bar.set_color("#ffa600")
+    fig.tight_layout()
+    return fig
 
 
 # ── SIDEBAR ────────────────────────────────────────────────────────────────────
@@ -271,7 +307,7 @@ tab_chat, tab_dashboard, tab_live, tab_history, tab_security = st.tabs([
     "📊 Dashboard",
     "📡 Live Logs",
     "🕓 History",
-    "🔒 Security Controls",
+    "🚩 Flagged IPs",
 ])
 
 
@@ -293,12 +329,11 @@ with tab_chat:
             st.session_state.ai_error     = None
             st.rerun()
     with tb2:
-        # Manual save button
         if st.button("💾 Save chat", use_container_width=True,
                      disabled=not st.session_state.messages):
             save_history(st.session_state.session_name,
                          st.session_state.messages)
-            st.toast("✅ Chat saved to history!")
+            st.toast("✅ Chat saved!")
     with tb3:
         if st.session_state.messages:
             pdf_bytes = generate_pdf(st.session_state.messages,
@@ -345,7 +380,6 @@ with tab_chat:
             reply = response.choices[0].message.content
             st.session_state.messages.append(
                 {"role": "assistant", "content": reply})
-            # Auto-save after every reply
             save_history(st.session_state.session_name,
                          st.session_state.messages)
         except Exception as e:
@@ -362,7 +396,6 @@ with tab_dashboard:
     if not st.session_state.logging_active or not selected_files:
         st.info("Start monitoring from the sidebar to see the dashboard.")
     else:
-        # ── Refresh button at the TOP ──────────────────────────────────────────
         dc1, dc2 = st.columns([1, 5])
         with dc1:
             if st.button("🔄 Refresh", use_container_width=True,
@@ -373,18 +406,19 @@ with tab_dashboard:
 
         st.divider()
 
+        # ── Collect stats ──────────────────────────────────────────────────────
         total_lines    = 0
         ip_counts: dict[str, int] = {}
         keyword_counts = {
             "Failed password": 0,
             "Accepted":        0,
             "sudo":            0,
+            "Invalid user":    0,
             "error":           0,
-            "warning":         0,
             "UFW BLOCK":       0,
         }
-        hourly_counts = {str(h).zfill(2): 0 for h in range(24)}
-        ip_pattern    = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+        hourly_counts  = {str(h).zfill(2): 0 for h in range(24)}
+        ip_pattern     = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
         for rel in selected_files:
             lines = read_last_n_lines(os.path.join(WATCH_DIR, rel), 2000)
@@ -399,33 +433,69 @@ with tab_dashboard:
                 if m and m.group(1) in hourly_counts:
                     hourly_counts[m.group(1)] += 1
 
+        # ── Metric cards ───────────────────────────────────────────────────────
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("📄 Lines analysed",  f"{total_lines:,}")
         c2.metric("🚫 Failed logins",    keyword_counts["Failed password"])
         c3.metric("✅ Accepted logins",  keyword_counts["Accepted"])
         c4.metric("🔥 Firewall blocks",  keyword_counts["UFW BLOCK"])
+
         st.divider()
 
-        st.subheader("Keyword frequency")
-        kw_data = {k: v for k, v in keyword_counts.items() if v > 0}
-        if kw_data:
-            st.bar_chart(kw_data)
-        else:
-            st.caption("No keyword matches yet.")
+        # ── Row 1: keyword bar + event-type pie ────────────────────────────────
+        row1_l, row1_r = st.columns(2)
 
-        st.subheader("Activity by hour")
-        if any(v > 0 for v in hourly_counts.values()):
-            st.bar_chart(hourly_counts)
+        with row1_l:
+            kw_data = {k: v for k, v in keyword_counts.items() if v > 0}
+            fig = bar_chart(kw_data, "Keyword frequency", color="#4da6ff")
+            if fig:
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+            else:
+                st.caption("No keyword matches yet.")
+
+        with row1_r:
+            # Pie: breakdown of event types
+            pie_data = {k: v for k, v in keyword_counts.items() if v > 0}
+            fig = pie_chart(pie_data, "Event type breakdown")
+            if fig:
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+            else:
+                st.caption("No data for pie chart yet.")
+
+        st.divider()
+
+        # ── Row 2: hourly activity bar ─────────────────────────────────────────
+        fig = hourly_bar(hourly_counts, "Activity by hour  (🟠 = busiest)")
+        if fig:
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
         else:
             st.caption("No timestamped entries found.")
 
-        st.subheader("Top 10 IPs")
+        st.divider()
+
+        # ── Row 3: top IPs bar + top IPs pie ──────────────────────────────────
         if ip_counts:
             top_ips = dict(sorted(ip_counts.items(),
                                   key=lambda x: x[1], reverse=True)[:10])
-            st.bar_chart(top_ips)
+            row3_l, row3_r = st.columns(2)
+
+            with row3_l:
+                fig = bar_chart(top_ips, "Top 10 IPs — hit count",
+                                color="#ffa600")
+                if fig:
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+
+            with row3_r:
+                fig = pie_chart(top_ips, "Top IPs — share of traffic")
+                if fig:
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
         else:
-            st.caption("No IPs found.")
+            st.caption("No IPs found in logs.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -543,39 +613,32 @@ with tab_history:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB 5 — SECURITY CONTROLS
+#  TAB 5 — FLAGGED IPs
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_security:
-    st.title("🔒 Security Controls")
+    st.title("🚩 Flagged IPs")
     flags = load_flags()
 
-    # ── Section 1: IPs from logs ───────────────────────────────────────────────
+    # ── Flag IPs from logs ─────────────────────────────────────────────────────
     st.subheader("IPs detected in logs")
 
     if not selected_files or not st.session_state.logging_active:
         st.info("Start monitoring to detect IPs.")
     else:
-        ip_counts   = extract_ips_from_logs(selected_files, 1000)
-        blocked_now = get_blocked_ips()
+        ip_counts = extract_ips_from_logs(selected_files, 1000)
 
         if not ip_counts:
             st.caption("No IPs found in current logs.")
         else:
-            st.caption("IP · Hits · Flag · Block · Note")
+            st.caption("IP · Hits · Flag · Note")
             for ip, count in list(ip_counts.items())[:30]:
                 is_flagged = flags.get(ip, {}).get("flagged", False)
-                is_blocked = ip in blocked_now
 
-                col_ip, col_count, col_flag, col_block, col_note = st.columns(
-                    [2, 1, 1, 1, 3])
+                col_ip, col_count, col_flag, col_note = st.columns([2, 1, 1, 4])
 
                 with col_ip:
-                    if is_blocked:
-                        st.markdown(f"🔴 `{ip}`")
-                    elif is_flagged:
-                        st.markdown(f"🚩 `{ip}`")
-                    else:
-                        st.markdown(f"`{ip}`")
+                    marker = "🚩" if is_flagged else "  "
+                    st.markdown(f"{marker} `{ip}`")
 
                 with col_count:
                     st.caption(f"{count} hits")
@@ -589,27 +652,6 @@ with tab_security:
                         flags[ip]["flagged"] = not is_flagged
                         save_flags(flags)
                         st.rerun()
-
-                with col_block:
-                    if is_blocked:
-                        if st.button("✅ Unblock", key=f"unblock_{ip}",
-                                     use_container_width=True):
-                            ok, msg = unblock_ip(ip)
-                            if ip in flags:
-                                flags[ip]["blocked"] = False
-                                save_flags(flags)
-                            st.toast(msg)
-                            st.rerun()
-                    else:
-                        if st.button("🚫 Block", key=f"block_{ip}",
-                                     type="primary", use_container_width=True):
-                            ok, msg = block_ip(ip)
-                            if ip not in flags:
-                                flags[ip] = {}
-                            flags[ip]["blocked"] = ok
-                            save_flags(flags)
-                            st.toast(msg if ok else f"❌ {msg}")
-                            st.rerun()
 
                 with col_note:
                     note = st.text_input(
@@ -625,64 +667,20 @@ with tab_security:
 
     st.divider()
 
-    # ── Section 2: Block a port ────────────────────────────────────────────────
-    st.subheader("Block / Unblock a port")
-    pc1, pc2, pc3, pc4 = st.columns([2, 1, 1, 1])
-    with pc1:
-        port_input = st.number_input("Port", min_value=1, max_value=65535,
-                                     value=22, label_visibility="collapsed")
-    with pc2:
-        proto = st.selectbox("Proto", ["tcp", "udp"],
-                             label_visibility="collapsed")
-    with pc3:
-        if st.button("🚫 Block port", use_container_width=True):
-            ok, msg = block_port(int(port_input), proto)
-            st.toast(msg if ok else f"❌ {msg}")
-            st.rerun()
-    with pc4:
-        if st.button("✅ Unblock port", use_container_width=True):
-            ok, msg = unblock_port(int(port_input), proto)
-            st.toast(msg)
-            st.rerun()
-
-    st.divider()
-
-    # ── Section 3: Currently blocked IPs ──────────────────────────────────────
-    st.subheader("Currently blocked IPs")
-    blocked_now = get_blocked_ips()
-    if not blocked_now:
-        st.caption("No IPs currently blocked.")
-    else:
-        for ip in blocked_now:
-            bc1, bc2 = st.columns([3, 1])
-            with bc1:
-                note = flags.get(ip, {}).get("note", "")
-                st.markdown(f"🔴 `{ip}`" + (f" — {note}" if note else ""))
-            with bc2:
-                if st.button("✅ Unblock", key=f"ub2_{ip}",
-                             use_container_width=True):
-                    unblock_ip(ip)
-                    if ip in flags:
-                        flags[ip]["blocked"] = False
-                        save_flags(flags)
-                    st.rerun()
-
-    st.divider()
-
-    # ── Section 4: Flagged IPs ─────────────────────────────────────────────────
-    st.subheader("Flagged IPs")
+    # ── Summary of all flagged IPs ─────────────────────────────────────────────
+    st.subheader("All flagged IPs")
     flagged = {ip: d for ip, d in flags.items() if d.get("flagged")}
     if not flagged:
-        st.caption("No flagged IPs.")
+        st.caption("No flagged IPs yet.")
     else:
         for ip, d in flagged.items():
-            fc1, fc2, fc3 = st.columns([2, 3, 1])
+            fc1, fc2, fc3 = st.columns([2, 4, 1])
             with fc1:
                 st.markdown(f"🚩 `{ip}`")
             with fc2:
-                st.caption(d.get("note", ""))
+                st.caption(d.get("note", "—"))
             with fc3:
-                if st.button("Remove flag", key=f"remflag_{ip}",
+                if st.button("Remove", key=f"remflag_{ip}",
                              use_container_width=True):
                     flags[ip]["flagged"] = False
                     save_flags(flags)
