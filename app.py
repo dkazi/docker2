@@ -30,6 +30,7 @@ for k, v in {
     "multiselect_key": 0,
     "last_pos":        {},
     "session_name":    datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+    "selected_files":  [],
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -312,10 +313,16 @@ with st.sidebar:
     selected_files = st.multiselect(
         "Select files to monitor:",
         options=files,
-        default=None,
+        default=st.session_state.selected_files if not st.session_state.logging_active else st.session_state.selected_files,
         disabled=st.session_state.logging_active,
         key=f"files_{st.session_state.multiselect_key}",
     )
+
+    # Αποθήκευσε την επιλογή στο session_state ώστε να μην χαθεί μετά το disable
+    if not st.session_state.logging_active:
+        st.session_state.selected_files = selected_files
+    else:
+        selected_files = st.session_state.selected_files
 
     if not st.session_state.logging_active:
         if st.button("✅ Start Monitoring", type="primary",
@@ -338,6 +345,7 @@ with st.sidebar:
             st.session_state.soc_messages    = []
             st.session_state.multiselect_key += 1
             st.session_state.last_pos        = {}
+            st.session_state.selected_files  = []
             if os.path.exists(MASTER_FILE_PATH):
                 os.remove(MASTER_FILE_PATH)
             st.rerun()
