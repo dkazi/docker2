@@ -1,12 +1,16 @@
+import os
 import re
 import urllib
+
+# MUST set before importing chromadb — otherwise telemetry init runs first
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+os.environ["CHROMA_TELEMETRY"]     = "false"
 
 import chromadb
 from openai import OpenAI
 from dotenv import load_dotenv
 from collections import defaultdict
 from datetime import datetime
-import os
 from statistics import mean
 from tqdm import tqdm
 
@@ -14,10 +18,6 @@ from tqdm import tqdm
 # LOAD ENVIRONMENT AND CLIENTS
 # ---------------------------------------------------------------------
 load_dotenv()
-
-# Disable chromadb telemetry (prevents capture() errors)
-os.environ["ANONYMIZED_TELEMETRY"] = "false"
-os.environ["CHROMA_TELEMETRY"] = "false"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
