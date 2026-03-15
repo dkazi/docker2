@@ -76,7 +76,7 @@ def load_all_sessions() -> dict:
 
 
 def generate_pdf(messages: list, session_name: str) -> bytes:
-    lines = [f"LogGuard AI — Chat Export", f"Session: {session_name}", ""]
+    lines = ["LogGuard AI — Chat Export", f"Session: {session_name}", ""]
     for m in messages:
         role = "You" if m["role"] == "user" else "AI Analyst"
         lines.append(f"[{role}]")
@@ -95,14 +95,12 @@ def generate_pdf(messages: list, session_name: str) -> bytes:
         offsets.append(len(b"%PDF-1.4\n") + len(objects_body))
         objects_body += f"{oid} 0 obj\n{content}\nendobj\n".encode()
 
-    y = 780
     stream_lines = ["BT", "/F1 10 Tf", "50 780 Td"]
+    y = 780
     for line in lines:
         safe = (line.replace("\\", "\\\\")
-                    .replace("(", "\\(")
-                    .replace(")", "\\)")
-                    .encode("latin-1", errors="replace")
-                    .decode("latin-1"))
+                    .replace("(", "\\(").replace(")", "\\)")
+                    .encode("latin-1", errors="replace").decode("latin-1"))
         stream_lines.append(f"({safe}) Tj")
         y -= 14
         if y < 50:
@@ -111,8 +109,7 @@ def generate_pdf(messages: list, session_name: str) -> bytes:
         else:
             stream_lines.append("0 -14 Td")
     stream_lines.append("ET")
-    stream = "\n".join(stream_lines)
-    stream_bytes = stream.encode("latin-1", errors="replace")
+    stream_bytes = "\n".join(stream_lines).encode("latin-1", errors="replace")
 
     write_obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
     write_obj(2, "<< /Type /Pages /Kids [4 0 R] /Count 1 >>")
@@ -132,9 +129,8 @@ def generate_pdf(messages: list, session_name: str) -> bytes:
     return b"%PDF-1.4\n" + objects_body + xref.encode() + trailer.encode()
 
 
-# ── IP / PORT CONTROL (iptables) ───────────────────────────────────────────────
+# ── IP / PORT CONTROL ──────────────────────────────────────────────────────────
 def load_flags() -> dict:
-    """{ ip: { "flagged": bool, "blocked": bool, "note": str } }"""
     if os.path.exists(FLAGS_FILE):
         try:
             with open(FLAGS_FILE) as f:
@@ -150,60 +146,69 @@ def save_flags(data: dict):
 
 
 def run_iptables(args: list[str]) -> tuple[bool, str]:
-    """Run an iptables command. Returns (success, message)."""
-    try:
-        result = subprocess.run(
-            ["iptables"] + args,
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            return True, result.stdout.strip()
-        return False, result.stderr.strip()
-    except FileNotFoundError:
-        return False, "iptables not found — is the container running with privileged: true?"
-    except Exception as e:
-        return False, str(e)
+    # Try iptables, fallback to iptables-legacy (common in newer kernels)
+    for cmd in ["iptables", "iptables-legacy"]:
+        try:
+            result = subprocess.run(
+                [cmd] + args,
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return True, result.stdout.strip()
+            # rule doesn't exist is ok for -D
+            if "does a rule exist" in result.stderr or \
+               "No chain/target/match" in result.stderr or \
+               "Bad rule" in result.stderr:
+                return True, "rule not found (already removed)"
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            return False, str(e)
+    return False, ("iptables not available. Make sure docker-compose.yml "
+                   "has 'privileged: true' and 'network_mode: host', "
+                   "then rebuild: docker compose up --build")
 
 
 def block_ip(ip: str) -> tuple[bool, str]:
-    ok, msg = run_iptables(["-I", "INPUT", "1", "-s", ip, "-j", "DROP"])
-    if ok:
-        run_iptables(["-I", "OUTPUT", "1", "-d", ip, "-j", "DROP"])
-    return ok, msg
+    ok1, m1 = run_iptables(["-I", "INPUT",  "1", "-s", ip, "-j", "DROP"])
+    ok2, m2 = run_iptables(["-I", "OUTPUT", "1", "-d", ip, "-j", "DROP"])
+    if ok1 and ok2:
+        return True, f"Blocked {ip} (INPUT + OUTPUT)"
+    return False, m1 or m2
 
 
 def unblock_ip(ip: str) -> tuple[bool, str]:
-    run_iptables(["-D", "INPUT", "-s", ip, "-j", "DROP"])
-    ok, msg = run_iptables(["-D", "OUTPUT", "-d", ip, "-j", "DROP"])
-    return True, "Unblocked"
+    run_iptables(["-D", "INPUT",  "-s", ip, "-j", "DROP"])
+    run_iptables(["-D", "OUTPUT", "-d", ip, "-j", "DROP"])
+    return True, f"Unblocked {ip}"
 
 
 def block_port(port: int, proto: str = "tcp") -> tuple[bool, str]:
-    return run_iptables(["-I", "INPUT", "1", "-p", proto,
-                         "--dport", str(port), "-j", "DROP"])
+    ok, msg = run_iptables(["-I", "INPUT", "1", "-p", proto,
+                            "--dport", str(port), "-j", "DROP"])
+    return ok, f"Port {port}/{proto} blocked" if ok else msg
 
 
 def unblock_port(port: int, proto: str = "tcp") -> tuple[bool, str]:
     run_iptables(["-D", "INPUT", "-p", proto, "--dport", str(port), "-j", "DROP"])
-    return True, "Port unblocked"
+    return True, f"Port {port}/{proto} unblocked"
 
 
 def get_blocked_ips() -> list[str]:
-    """Read currently blocked IPs from iptables INPUT chain."""
     ok, out = run_iptables(["-L", "INPUT", "-n", "--line-numbers"])
     if not ok:
         return []
     ips = []
+    ip_pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
     for line in out.splitlines():
         if "DROP" in line:
-            m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+            m = ip_pattern.search(line)
             if m:
-                ips.append(m.group(1))
+                ips.append(m.group())
     return list(set(ips))
 
 
 def extract_ips_from_logs(selected: list[str], n: int = 1000) -> dict[str, int]:
-    """Return { ip: count } from the last N lines of selected log files."""
     ip_pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
     counts: dict[str, int] = {}
     for rel in selected:
@@ -276,19 +281,25 @@ tab_chat, tab_dashboard, tab_live, tab_history, tab_security = st.tabs([
 with tab_chat:
     st.title("🤖 AI Security Analyst")
 
-    # ── Top action bar ─────────────────────────────────────────────────────────
-    tb1, tb2, tb3 = st.columns([1, 1, 5])
+    tb1, tb2, tb3 = st.columns([1, 1, 1])
     with tb1:
         if st.button("🆕 New chat", use_container_width=True):
             if st.session_state.messages:
                 save_history(st.session_state.session_name,
                              st.session_state.messages)
-            st.session_state.messages    = []
+            st.session_state.messages     = []
             st.session_state.session_name = datetime.now().strftime(
                 "%Y-%m-%d_%H-%M-%S")
-            st.session_state.ai_error    = None
+            st.session_state.ai_error     = None
             st.rerun()
     with tb2:
+        # Manual save button
+        if st.button("💾 Save chat", use_container_width=True,
+                     disabled=not st.session_state.messages):
+            save_history(st.session_state.session_name,
+                         st.session_state.messages)
+            st.toast("✅ Chat saved to history!")
+    with tb3:
         if st.session_state.messages:
             pdf_bytes = generate_pdf(st.session_state.messages,
                                      st.session_state.session_name)
@@ -303,6 +314,11 @@ with tab_chat:
     st.divider()
 
     can_chat = bool(api_key and selected_files and st.session_state.logging_active)
+    if not can_chat:
+        if not api_key:
+            st.warning("Enter your OpenAI API key in the sidebar.")
+        elif not st.session_state.logging_active:
+            st.warning("Start monitoring from the sidebar first.")
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -329,6 +345,7 @@ with tab_chat:
             reply = response.choices[0].message.content
             st.session_state.messages.append(
                 {"role": "assistant", "content": reply})
+            # Auto-save after every reply
             save_history(st.session_state.session_name,
                          st.session_state.messages)
         except Exception as e:
@@ -345,6 +362,17 @@ with tab_dashboard:
     if not st.session_state.logging_active or not selected_files:
         st.info("Start monitoring from the sidebar to see the dashboard.")
     else:
+        # ── Refresh button at the TOP ──────────────────────────────────────────
+        dc1, dc2 = st.columns([1, 5])
+        with dc1:
+            if st.button("🔄 Refresh", use_container_width=True,
+                         key="dash_refresh"):
+                st.rerun()
+        with dc2:
+            st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+
+        st.divider()
+
         total_lines    = 0
         ip_counts: dict[str, int] = {}
         keyword_counts = {
@@ -372,10 +400,10 @@ with tab_dashboard:
                     hourly_counts[m.group(1)] += 1
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("📄 Lines analysed",   f"{total_lines:,}")
-        c2.metric("🚫 Failed logins",     keyword_counts["Failed password"])
-        c3.metric("✅ Accepted logins",   keyword_counts["Accepted"])
-        c4.metric("🔥 Firewall blocks",   keyword_counts["UFW BLOCK"])
+        c1.metric("📄 Lines analysed",  f"{total_lines:,}")
+        c2.metric("🚫 Failed logins",    keyword_counts["Failed password"])
+        c3.metric("✅ Accepted logins",  keyword_counts["Accepted"])
+        c4.metric("🔥 Firewall blocks",  keyword_counts["UFW BLOCK"])
         st.divider()
 
         st.subheader("Keyword frequency")
@@ -399,9 +427,6 @@ with tab_dashboard:
         else:
             st.caption("No IPs found.")
 
-        if st.button("🔄 Refresh dashboard"):
-            st.rerun()
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TAB 3 — LIVE LOGS
@@ -414,7 +439,6 @@ with tab_live:
     else:
         now_str = datetime.now().strftime("%H:%M:%S")
 
-        # ── Top bar: indicator + refresh controls ──────────────────────────────
         top1, top2, top3 = st.columns([3, 1, 1])
         with top1:
             st.html(f"""
@@ -482,7 +506,8 @@ with tab_history:
 
     sessions = load_all_sessions()
     if not sessions:
-        st.info("No saved sessions yet. Conversations are saved automatically.")
+        st.info("No saved sessions yet. Use 💾 Save chat or chat — "
+                "sessions are auto-saved after each AI reply.")
     else:
         selected_session = st.selectbox(
             "Select a session:", options=list(sessions.keys()))
@@ -497,7 +522,7 @@ with tab_history:
                     st.markdown(msg["content"])
 
             st.divider()
-            hc1, hc2, hc3 = st.columns([1, 1, 4])
+            hc1, hc2 = st.columns([1, 1])
             with hc1:
                 pdf_bytes = generate_pdf(msgs, selected_session)
                 st.download_button(
@@ -509,7 +534,7 @@ with tab_history:
                     use_container_width=True,
                 )
             with hc2:
-                if st.button("🗑️ Delete", key="del_session",
+                if st.button("🗑️ Delete session", key="del_session",
                              use_container_width=True):
                     path = os.path.join(HISTORY_DIR, f"{selected_session}.json")
                     if os.path.exists(path):
@@ -530,12 +555,13 @@ with tab_security:
     if not selected_files or not st.session_state.logging_active:
         st.info("Start monitoring to detect IPs.")
     else:
-        ip_counts = extract_ips_from_logs(selected_files, 1000)
+        ip_counts   = extract_ips_from_logs(selected_files, 1000)
         blocked_now = get_blocked_ips()
 
         if not ip_counts:
             st.caption("No IPs found in current logs.")
         else:
+            st.caption("IP · Hits · Flag · Block · Note")
             for ip, count in list(ip_counts.items())[:30]:
                 is_flagged = flags.get(ip, {}).get("flagged", False)
                 is_blocked = ip in blocked_now
@@ -566,7 +592,7 @@ with tab_security:
 
                 with col_block:
                     if is_blocked:
-                        if st.button("Unblock", key=f"unblock_{ip}",
+                        if st.button("✅ Unblock", key=f"unblock_{ip}",
                                      use_container_width=True):
                             ok, msg = unblock_ip(ip)
                             if ip in flags:
@@ -582,14 +608,15 @@ with tab_security:
                                 flags[ip] = {}
                             flags[ip]["blocked"] = ok
                             save_flags(flags)
-                            st.toast(msg if ok else f"Failed: {msg}")
+                            st.toast(msg if ok else f"❌ {msg}")
                             st.rerun()
 
                 with col_note:
-                    note = st.text_input("Note", key=f"note_{ip}",
-                                         value=flags.get(ip, {}).get("note", ""),
-                                         placeholder="add a note…",
-                                         label_visibility="collapsed")
+                    note = st.text_input(
+                        "Note", key=f"note_{ip}",
+                        value=flags.get(ip, {}).get("note", ""),
+                        placeholder="add a note…",
+                        label_visibility="collapsed")
                     if note != flags.get(ip, {}).get("note", ""):
                         if ip not in flags:
                             flags[ip] = {}
@@ -602,27 +629,26 @@ with tab_security:
     st.subheader("Block / Unblock a port")
     pc1, pc2, pc3, pc4 = st.columns([2, 1, 1, 1])
     with pc1:
-        port_input = st.number_input("Port number", min_value=1,
-                                     max_value=65535, value=22,
-                                     label_visibility="collapsed")
+        port_input = st.number_input("Port", min_value=1, max_value=65535,
+                                     value=22, label_visibility="collapsed")
     with pc2:
-        proto = st.selectbox("Protocol", ["tcp", "udp"],
+        proto = st.selectbox("Proto", ["tcp", "udp"],
                              label_visibility="collapsed")
     with pc3:
         if st.button("🚫 Block port", use_container_width=True):
             ok, msg = block_port(int(port_input), proto)
-            st.toast(f"Port {port_input}/{proto}: {msg if ok else 'Failed: ' + msg}")
+            st.toast(msg if ok else f"❌ {msg}")
             st.rerun()
     with pc4:
         if st.button("✅ Unblock port", use_container_width=True):
             ok, msg = unblock_port(int(port_input), proto)
-            st.toast(f"Port {port_input}/{proto}: {msg}")
+            st.toast(msg)
             st.rerun()
 
     st.divider()
 
     # ── Section 3: Currently blocked IPs ──────────────────────────────────────
-    st.subheader("Currently blocked IPs (iptables)")
+    st.subheader("Currently blocked IPs")
     blocked_now = get_blocked_ips()
     if not blocked_now:
         st.caption("No IPs currently blocked.")
@@ -633,7 +659,7 @@ with tab_security:
                 note = flags.get(ip, {}).get("note", "")
                 st.markdown(f"🔴 `{ip}`" + (f" — {note}" if note else ""))
             with bc2:
-                if st.button("Unblock", key=f"ub2_{ip}",
+                if st.button("✅ Unblock", key=f"ub2_{ip}",
                              use_container_width=True):
                     unblock_ip(ip)
                     if ip in flags:
